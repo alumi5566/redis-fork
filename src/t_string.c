@@ -291,7 +291,13 @@ int parseExtendedStringArgumentsOrReply(client *c, int *flags, int *unit, robj *
 
 /* SET key value [NX] [XX] [KEEPTTL] [GET] [EX <seconds>] [PX <milliseconds>]
  *     [EXAT <seconds-timestamp>][PXAT <milliseconds-timestamp>] */
+// [CY] This is the logic for SET command
+// when you > SET user:1 "alice"
+// argv[1] = user:1
+// argv[2] = "alice"
+// Actual write happens in dbAdd() or dbOverwrite() in db.c.
 void setCommand(client *c) {
+    serverLog(LL_NOTICE, "[CY] SET key=%s value=%s", (char*)c->argv[1]->ptr, (char*)c->argv[2]->ptr);
     robj *expire = NULL;
     int unit = UNIT_SECONDS;
     int flags = OBJ_NO_FLAGS;
@@ -319,7 +325,12 @@ void psetexCommand(client *c) {
     setGenericCommand(c, OBJ_PX, c->argv[1], &(c->argv[3]), c->argv[2], UNIT_MILLISECONDS, NULL, NULL);
 }
 
+// [CY] getCommand() and getGenericCommand() are the logic for GET command
+// when you > GET user:1
+// c->argv[1] = user:1
+// Actual read happens in lookupKeyRead() in db.c.
 int getGenericCommand(client *c) {
+    serverLog(LL_NOTICE, "[CY] GET key=%s", (char*)c->argv[1]->ptr);
     kvobj *o;
 
     if ((o = lookupKeyReadOrReply(c, c->argv[1], shared.null[c->resp])) == NULL)

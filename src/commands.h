@@ -20,6 +20,7 @@ typedef enum {
 #define CMD_ARG_MULTIPLE_TOKEN  (1<<2)
 
 /* Must be compatible with RedisModuleCommandArg. See moduleCopyCommandArgs. */
+// [CY] accepting args in server.c
 typedef struct redisCommandArg {
     const char *name;
     redisCommandArgType type;
