@@ -11515,6 +11515,29 @@ struct COMMAND_STRUCT redisCommandTable[] = {
 {MAKE_CMD("setrange","Overwrites a part of a string value with another by an offset. Creates the key if it doesn't exist.","O(1), not counting the time taken to copy the new string in place. Usually, this string is very small so the amortized complexity is O(1). Otherwise, complexity is O(M) with M being the length of the value argument.","2.2.0",CMD_DOC_NONE,NULL,NULL,"string",COMMAND_GROUP_STRING,SETRANGE_History,0,SETRANGE_Tips,0,setrangeCommand,4,CMD_WRITE|CMD_DENYOOM,ACL_CATEGORY_STRING,SETRANGE_Keyspecs,1,NULL,3),.args=SETRANGE_Args},
 {MAKE_CMD("strlen","Returns the length of a string value.","O(1)","2.2.0",CMD_DOC_NONE,NULL,NULL,"string",COMMAND_GROUP_STRING,STRLEN_History,0,STRLEN_Tips,0,strlenCommand,2,CMD_READONLY|CMD_FAST,ACL_CATEGORY_STRING,STRLEN_Keyspecs,1,NULL,1),.args=STRLEN_Args},
 {MAKE_CMD("substr","Returns a substring from a string value.","O(N) where N is the length of the returned string. The complexity is ultimately determined by the returned length, but because creating a substring from an existing string is very cheap, it can be considered O(1) for small strings.","1.0.0",CMD_DOC_DEPRECATED,"`GETRANGE`","2.0.0","string",COMMAND_GROUP_STRING,SUBSTR_History,0,SUBSTR_Tips,0,getrangeCommand,4,CMD_READONLY,ACL_CATEGORY_STRING,SUBSTR_Keyspecs,1,NULL,3),.args=SUBSTR_Args},
+{MAKE_CMD(
+  "cytest",                       /* name */
+  "Returns a static test string.",/* summary */
+  "O(1)",                         /* complexity */
+  "0.0.0",                        /* since */
+  CMD_DOC_NONE,                   /* doc_flags */
+  NULL,                           /* replaced */
+  NULL,                           /* deprecated */
+  "string",                       /* group (label) */
+  COMMAND_GROUP_STRING,           /* group enum */
+  0,                              /* history id */
+  0,                              /* num_history */
+  0,                              /* tips id */
+  0,                              /* num_tips */
+  cytestCommand,                  /* function */
+  1,                              /* arity (just the command name, no args) */
+  CMD_READONLY|CMD_FAST,          /* flags */
+  ACL_CATEGORY_STRING,            /* ACL category */
+  0,                              /* key_specs id (0 = none) */
+  0,                              /* key_specs_num */
+  NULL,                           /* get_keys proc */
+  0                               /* numargs */
+)},
 /* transactions */
 {MAKE_CMD("discard","Discards a transaction.","O(N), when N is the number of queued commands","2.0.0",CMD_DOC_NONE,NULL,NULL,"transactions",COMMAND_GROUP_TRANSACTIONS,DISCARD_History,0,DISCARD_Tips,0,discardCommand,1,CMD_NOSCRIPT|CMD_LOADING|CMD_STALE|CMD_FAST|CMD_ALLOW_BUSY,ACL_CATEGORY_TRANSACTION,DISCARD_Keyspecs,0,NULL,0)},
 {MAKE_CMD("exec","Executes all commands in a transaction.","Depends on commands in the transaction","1.2.0",CMD_DOC_NONE,NULL,NULL,"transactions",COMMAND_GROUP_TRANSACTIONS,EXEC_History,0,EXEC_Tips,0,execCommand,1,CMD_NOSCRIPT|CMD_LOADING|CMD_STALE|CMD_SKIP_SLOWLOG,ACL_CATEGORY_TRANSACTION,EXEC_Keyspecs,0,NULL,0)},

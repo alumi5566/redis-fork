@@ -289,6 +289,22 @@ int parseExtendedStringArgumentsOrReply(client *c, int *flags, int *unit, robj *
     return C_OK;
 }
 
+// [CY] self-defined dummy command, for testing command
+void cytestCommand(client *c) {
+    serverLog(LL_NOTICE, "[CY] TEST");
+    /* Always read the fixed key "cy" from the current DB */
+    robj *key = createStringObject("cy", 2);
+    robj *val = lookupKeyRead(c->db, key);
+
+    if (val == NULL) {
+        addReplyNull(c);
+    } else {
+        addReplyBulk(c, val);
+    }
+
+    decrRefCount(key);
+}
+
 /* SET key value [NX] [XX] [KEEPTTL] [GET] [EX <seconds>] [PX <milliseconds>]
  *     [EXAT <seconds-timestamp>][PXAT <milliseconds-timestamp>] */
 // [CY] This is the logic for SET command
