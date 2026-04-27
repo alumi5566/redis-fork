@@ -446,18 +446,12 @@ void cytestCommand(client *c) {
 }
 
 /* SET key value [NX] [XX] [KEEPTTL] [GET] [EX <seconds>] [PX <milliseconds>]
-    [CY] This is the logic for SET command
-    when you > SET user:1 "alice"
-    argv[1] = user:1
-    argv[2] = "alice"
-    Actual write happens in dbAdd() or dbOverwrite() in db.c.
-    serverLog(LL_NOTICE, "[CY] SET key=%s value=%s", (char*)c->argv[1]->ptr, (char*)c->argv[2]->ptr);
  *     [EXAT <seconds-timestamp>][PXAT <milliseconds-timestamp>]
  *     [IFEQ <match-value>|IFNE <match-value>|IFDEQ <match-digest>|
  *      IFDNE <match-digest>]*/
 void setCommand(client *c) {
     extendedStringArgs args;
-
+    serverLog(LL_NOTICE, "[CY] SET key=%s value=%s", (char*)c->argv[1]->ptr, (char*)c->argv[2]->ptr);
     if (parseExtendedStringArgumentsOrReply(c, 3, &args, COMMAND_SET) != C_OK) {
         return;
     }
