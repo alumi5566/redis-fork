@@ -1,5 +1,18 @@
 [![codecov](https://codecov.io/github/redis/redis/graph/badge.svg?token=6bVHb5fRuz)](https://codecov.io/github/redis/redis)
 
+
+# CY self note:
+```
+Terminal #1:
+$ make clean
+$ make BUILD_TLS=yes
+
+Terminal #2:
+$ ./src/redis-cli
+> SET user:1 alice
+> GET user:1
+```
+
 This document serves as both a quick start guide to Redis and a detailed resource for building it from source.
 
 - New to Redis? Start with [What is Redis](#what-is-redis) and [Getting Started](#getting-started)

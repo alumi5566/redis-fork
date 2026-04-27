@@ -352,6 +352,7 @@ kvobj *lookupKeyReadWithFlags(redisDb *db, robj *key, int flags) {
 
 /* Like lookupKeyReadWithFlags(), but does not use any flag, which is the
  * common case. */
+// [CY] GET command calls this
 kvobj *lookupKeyRead(redisDb *db, robj *key) {
     return lookupKeyReadWithFlags(db,key,LOOKUP_NONE);
 }
@@ -380,6 +381,7 @@ kvobj *lookupKeyWriteWithLink(redisDb *db, robj *key, dictEntryLink *link) {
     return lookupKey(db, key, LOOKUP_NONE | LOOKUP_WRITE, link);
 }
 
+// [CY] GET command calls this
 kvobj *lookupKeyReadOrReply(client *c, robj *key, robj *reply) {
     kvobj *kv = lookupKeyRead(c->db, key);
     if (!kv) addReplyOrErrorObject(c, reply);
@@ -450,6 +452,7 @@ kvobj *dbAddInternal(redisDb *db, robj *key, robj **valref, dictEntryLink *link,
 }
 
 /* Read dbAddInternal() comment */
+// [CY] SET command calls this
 kvobj *dbAdd(redisDb *db, robj *key, robj **valref) {
     KeyMetaSpec keyMetaEmpty; /* No metadata added */
     keyMetaSpecInit(&keyMetaEmpty);

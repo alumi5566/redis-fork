@@ -4235,6 +4235,7 @@ void afterCommand(client *c) {
 
 /* Check if c->cmd exists, fills `err` with details in case it doesn't.
  * Return 1 if exists. */
+// [CY] check the command server receive existing or not 
 int commandCheckExistence(client *c, sds *err) {
     if (c->cmd)
         return 1;
@@ -7866,7 +7867,7 @@ int main(int argc, char **argv) {
     struct timeval tv;
     int j;
     char config_from_stdin = 0;
-
+    printf("🔧 [CY-DEBUG] Redis is starting on Apple Silicon...\n");
 #ifdef REDIS_TEST
     monotonicInit(); /* Required for dict tests, that are relying on monotime during dict rehashing. */
     if (argc >= 3 && !strcasecmp(argv[1], "test")) {

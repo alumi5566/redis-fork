@@ -797,6 +797,7 @@ static dictEntryLink dictFindLinkInternal(dict *d, const void *key, dictEntryLin
     return NULL;
 }
 
+// [CY] GET command calls this
 dictEntry *dictFind(dict *d, const void *key)
 {
     dictEntryLink link = dictFindLink(d, key, NULL);
