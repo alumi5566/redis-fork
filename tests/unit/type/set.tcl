@@ -1026,7 +1026,22 @@ foreach type {single multiple single_multiple} {
                 break
             }
         }
-        r srem $myset {*}$members
+        r deferred 1
+        set count 0
+        foreach m $members {
+            r srem $myset $m
+            incr count
+            if {$count == 500} {
+                for {set i 0} {$i < 500} {incr i} {
+                    r read
+                }
+                set count 0
+            }
+        }
+        for {set i 0} {$i < $count} {incr i} {
+            r read
+        }
+        r deferred 0
     }
 
     proc verify_rehashing_completed_key {myset table_size keys} {
@@ -1132,7 +1147,7 @@ foreach type {single multiple single_multiple} {
         r config set save $origin_save
         r config set set-max-listpack-entries $origin_max_lp
         r config set rdb-key-save-delay $origin_save_delay
-    } {OK} {needs:debug slow}
+    } {OK} {needs:debug slow debug_defrag:skip}
 
     proc setup_move {} {
         r del myset3{t} myset4{t}

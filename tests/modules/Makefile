@@ -83,7 +83,10 @@ TEST_MODULES = \
     rdbloadsave.so \
     crash.so \
     internalsecret.so \
-    configaccess.so
+    configaccess.so \
+    test_keymeta.so \
+    keymeta_notify.so \
+    atomicslotmigration.so
 
 .PHONY: all
 

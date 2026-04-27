@@ -129,7 +129,14 @@ proc waitForBgrewriteaof r {
 }
 
 proc wait_for_sync r {
-    wait_for_condition 50 100 {
+    set maxtries 50
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {$::tsan} {
+        set maxtries 100
+    }
+
+    wait_for_condition $maxtries 100 {
         [status $r master_link_status] eq "up"
     } else {
         fail "replica didn't sync in time"
@@ -137,6 +144,12 @@ proc wait_for_sync r {
 }
 
 proc wait_replica_online {r {replica_id 0} {maxtries 50} {delay 100}} {
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {$::tsan} {
+        set maxtries [expr {$maxtries * 2}]
+    }
+
     wait_for_condition $maxtries $delay {
         [string match "*slave$replica_id:*,state=online*" [$r info replication]]
     } else {
@@ -145,7 +158,13 @@ proc wait_replica_online {r {replica_id 0} {maxtries 50} {delay 100}} {
 }
 
 proc wait_for_ofs_sync {r1 r2} {
-    wait_for_condition 50 100 {
+    set maxtries 50
+    # tsan adds significant overhead to the execution time, so we increase the
+    # wait time here JIC
+    if {$::tsan} {
+        set maxtries 100
+    }
+    wait_for_condition $maxtries 100 {
         [status $r1 master_repl_offset] eq [status $r2 master_repl_offset]
     } else {
         fail "replica offset didn't match in time"
@@ -585,9 +604,11 @@ proc find_valgrind_errors {stderr on_termination} {
 # Execute a background process writing random data for the specified number
 # of seconds to the specified Redis instance. If key is omitted, a random key
 # is used for every SET command.
-proc start_write_load {host port seconds {key ""} {size 0} {sleep 0}} {
+# ignore_error_reply (default 0): set non-zero in cluster slot-migration tests to tolerate
+# MOVED/ASK replies while draining pipelined writes in the load helper.
+proc start_write_load {host port seconds {key ""} {size 0} {sleep 0} {ignore_error_reply 0}} {
     set tclsh [info nameofexecutable]
-    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds $::tls $key $size $sleep &
+    exec $tclsh tests/helpers/gen_write_load.tcl $host $port $seconds $::tls $key $size $sleep $ignore_error_reply &
 }
 
 # Stop a process generating write load executed with start_write_load.
@@ -685,24 +706,60 @@ proc process_is_alive pid {
     }
 }
 
-proc pause_process pid {
+proc get_system_name {} {
+    return [string tolower [exec uname -s]]
+}
+
+proc get_proc_state {pid} {
+    if {[get_system_name] eq {sunos}} {
+        return [exec ps -o s= -p $pid]
+    } else {
+        return [exec ps -o state= -p $pid]
+    }
+}
+
+proc get_proc_job {pid} {
+    if {[get_system_name] eq {sunos}} {
+        return [exec ps -l -p $pid]
+    } else {
+        return [exec ps j $pid]
+    }
+}
+
+proc pause_process {pid} {
     exec kill -SIGSTOP $pid
     wait_for_condition 50 100 {
-        [string match {*T*} [lindex [exec ps j $pid] 16]]
+        [string match "T*" [get_proc_state $pid]]
     } else {
-        puts [exec ps j $pid]
+        puts [get_proc_job $pid]
         fail "process didn't stop"
     }
 }
 
-proc resume_process pid {
+proc resume_process {pid} {
     wait_for_condition 50 1000 {
-        [string match "T*" [exec ps -o state= -p $pid]]
+        [string match "T*" [get_proc_state $pid]]
     } else {
-        puts [exec ps j $pid]
+        puts [get_proc_job $pid]
         fail "process was not stopped"
     }
-    exec kill -SIGCONT $pid
+
+    set max_attempts 10
+    set attempt 0
+    while {($attempt < $max_attempts) && [string match "T*" [exec ps -o state= -p $pid]]} {
+        exec kill -SIGCONT $pid
+
+        incr attempt
+        after 100
+    }
+
+    wait_for_condition 50 1000 {
+        [string match "R*" [exec ps -o state= -p $pid]] ||
+        [string match "S*" [exec ps -o state= -p $pid]]
+    } else {
+        puts [exec ps j $pid]
+        fail "process was not resumed"
+    }
 }
 
 proc cmdrstat {cmd r} {
@@ -741,9 +798,10 @@ proc generate_fuzzy_traffic_on_key {key type duration} {
     set zset_commands {ZADD ZCARD ZCOUNT ZINCRBY ZINTERSTORE ZLEXCOUNT ZPOPMAX ZPOPMIN ZRANGE ZRANGEBYLEX ZRANGEBYSCORE ZRANK ZREM ZREMRANGEBYLEX ZREMRANGEBYRANK ZREMRANGEBYSCORE ZREVRANGE ZREVRANGEBYLEX ZREVRANGEBYSCORE ZREVRANK ZSCAN ZSCORE ZUNIONSTORE ZRANDMEMBER}
     set list_commands {LINDEX LINSERT LLEN LPOP LPOS LPUSH LPUSHX LRANGE LREM LSET LTRIM RPOP RPOPLPUSH RPUSH RPUSHX}
     set set_commands {SADD SCARD SDIFF SDIFFSTORE SINTER SINTERSTORE SISMEMBER SMEMBERS SMOVE SPOP SRANDMEMBER SREM SSCAN SUNION SUNIONSTORE}
-    set stream_commands {XACK XADD XCLAIM XDEL XGROUP XINFO XLEN XPENDING XRANGE XREAD XREADGROUP XREVRANGE XTRIM XDELEX XACKDEL}
+    set stream_commands {XACK XADD XCLAIM XDEL XGROUP XINFO XLEN XPENDING XRANGE XREAD XREADGROUP XREVRANGE XTRIM XDELEX XACKDEL XNACK}
     set vset_commands {VADD VREM}
-    set commands [dict create string $string_commands hash $hash_commands zset $zset_commands list $list_commands set $set_commands stream $stream_commands vectorset $vset_commands]
+    set gcra_commands {GCRA}
+    set commands [dict create string $string_commands hash $hash_commands zset $zset_commands list $list_commands set $set_commands stream $stream_commands vectorset $vset_commands gcra $gcra_commands]
 
     set cmds [dict get $commands $type]
     set start_time [clock seconds]
@@ -981,7 +1039,7 @@ proc wait_for_blocked_clients_count {count {maxtries 100} {delay 10} {idx 0}} {
     wait_for_condition $maxtries $delay  {
         [s $idx blocked_clients] == $count
     } else {
-        fail "Timeout waiting for blocked clients"
+        fail "Timeout waiting for blocked clients (expected $count, actual [s $idx blocked_clients])"
     }
 }
 
@@ -1073,7 +1131,7 @@ proc get_nonloopback_client {} {
 }
 
 # The following functions and variables are used only when running large-memory
-# tests. We avoid defining them when not running large-memory tests because the 
+# tests. We avoid defining them when not running large-memory tests because the
 # global variables takes up lots of memory.
 proc init_large_mem_vars {} {
     if {![info exists ::str500]} {
@@ -1208,7 +1266,7 @@ proc system_backtrace_supported {} {
         return 0
     }
 
-    set system_name [string tolower [exec uname -s]]
+    set system_name [get_system_name]
     if {$system_name eq {darwin}} {
         return 1
     } elseif {$system_name ne {linux}} {

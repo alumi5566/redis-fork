@@ -332,6 +332,40 @@ start_server {config "minimal.conf" tags {"external:skip"} overrides {enable-deb
             # With slower machines, the number of prefetch entries can be lower
             assert_range $new_prefetch_entries [expr {$prefetch_entries + 2}] [expr {$prefetch_entries + 16}]
         }
+
+        test {Prefetch works with batch size greater than 16 (buffer overflow regression test)} {
+            # save the current value of prefetch entries
+            set info [r info stats]
+            set prefetch_entries [getInfoProperty $info io_threaded_total_prefetch_entries]
+            # set the batch size to a value greater than the old hardcoded limit of 16
+            r config set prefetch-batch-max-size 64
+
+            # Create a batch with more than 16 clients to trigger the old buffer overflow
+            do_prefetch_batch $server_pid 64
+
+            # verify the prefetch entries increased
+            set info [r info stats]
+            set new_prefetch_entries [getInfoProperty $info io_threaded_total_prefetch_entries]
+            # With slower machines, the number of prefetch entries can be lower
+            assert_range $new_prefetch_entries [expr {$prefetch_entries + 2}] [expr {$prefetch_entries + 64}]
+        }
+
+        test {Prefetch works with maximum batch size of 128 and client number larger than batch size} {
+            # save the current value of prefetch entries
+            set info [r info stats]
+            set prefetch_entries [getInfoProperty $info io_threaded_total_prefetch_entries]
+            # set the batch size to the maximum allowed value
+            r config set prefetch-batch-max-size 128
+
+            # Create a batch with 300 clients to test the maximum limit
+            do_prefetch_batch $server_pid 300
+
+            # verify the prefetch entries increased
+            set info [r info stats]
+            set new_prefetch_entries [getInfoProperty $info io_threaded_total_prefetch_entries]
+            # With slower machines, the number of prefetch entries can be lower
+            assert_range $new_prefetch_entries [expr {$prefetch_entries + 2}] [expr {$prefetch_entries + 300}]
+        }
     }
 }
 
@@ -373,5 +407,40 @@ start_server {tags {"timeout external:skip"}} {
         # redis server still works well
         reconnect
         assert_equal "PONG" [r ping]
+    }
+}
+
+test {Pending command pool expansion and shrinking} {
+    start_server {overrides {loglevel debug io-threads 1} tags {external:skip}} {
+        set rd1 [redis_deferring_client]
+        set rd2 [redis_deferring_client]
+        
+        # Client1 sends 16 commands in pipeline, and was blocked at the first command
+        set buf ""
+        append buf "blpop mylist 0\r\n"
+        for {set i 1} {$i < 16} {incr i} {
+            append buf "set key$i value$i\r\n"
+        }
+        $rd1 write $buf
+        $rd1 flush
+        wait_for_blocked_clients_count 1
+        
+        # Client2 sends 1 command, this will trigger pending command pool expansion
+        # from 16 to 32 since A client has used up all 16 commands in the command pool.
+        $rd2 set bkey bvalue
+        assert_equal {OK} [$rd2 read]
+        
+        # Unblock client1, allowing it to return all pending commands back to the pool.
+        r lpush mylist unblock_value
+        assert_equal {mylist unblock_value} [$rd1 read]
+        for {set i 1} {$i < 16} {incr i} {
+            assert_equal {OK} [$rd1 read]
+        }
+        
+        # Wait for the pending command pool to shrink back to 16 due to low utilization.
+        wait_for_log_messages 0 {"*Shrunk pending command pool: capacity 32->16*"} 0 10 1000
+        
+        $rd1 close
+        $rd2 close
     }
 }

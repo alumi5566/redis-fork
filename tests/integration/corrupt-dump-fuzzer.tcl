@@ -59,6 +59,7 @@ proc generate_types {} {
     # create other non-collection types
     r incr int
     r set string str
+    r gcra gcra 10 5 60000
 
     # create bigger objects with 10 items (more than a single ziplist / listpack)
     generate_collections big 10
@@ -145,7 +146,13 @@ foreach sanitize_dump {no yes} {
                         }
                     }
                 } else {
-                    r ping ;# an attempt to check if the server didn't terminate (this will throw an error that will terminate the tests)
+                    # an attempt to check if the server didn't terminate (this will throw an error that will terminate the tests)
+                    if { [catch { r ping } err] } {
+                        set msg "Server crashed after RESTORE with payload: $printable_dump"
+                        write_log_line 0 $msg
+                        puts $msg
+                        error $err
+                    }
                 }
 
                 set print_commands false

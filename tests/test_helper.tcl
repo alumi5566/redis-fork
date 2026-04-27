@@ -3,13 +3,19 @@
 # Copyright (C) 2014-Present, Redis Ltd.
 # All Rights reserved.
 #
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
 # Licensed under your choice of (a) the Redis Source Available License 2.0
 # (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
 # GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
 
-package require Tcl 8.5
+package require Tcl 8.5-10
 
-set tcl_precision 17
+if {$tcl_version < 9.0} { set tcl_precision 17 }
 source tests/support/redis.tcl
 source tests/support/aofmanifest.tcl
 source tests/support/server.tcl
@@ -24,6 +30,7 @@ set ::all_tests []
 set test_dirs {
     unit
     unit/type
+    unit/moduleapi
     unit/cluster
     integration
 }
@@ -82,6 +89,7 @@ set ::ignoredigest 0
 set ::large_memory 0
 set ::log_req_res 0
 set ::force_resp3 0
+set ::debug_defrag 0
 
 # Set to 1 when we are running in client mode. The Redis test uses a
 # server-client model to run tests simultaneously. The server instance
@@ -237,6 +245,10 @@ proc s {args} {
     status [srv $level "client"] [lindex $args 0]
 }
 
+proc S {index field} {
+    getInfoProperty [R $index info] $field
+}
+
 # Get the specified field from the givens instances cluster info output.
 proc CI {index field} {
     getInfoProperty [R $index cluster info] $field
@@ -321,7 +333,7 @@ proc test_server_cron {} {
 }
 
 proc accept_test_clients {fd addr port} {
-    fconfigure $fd -encoding binary
+    fconfigure $fd -translation binary
     fileevent $fd readable [list read_from_test_client $fd]
 }
 
@@ -342,7 +354,7 @@ proc accept_test_clients {fd addr port} {
 #       ready to accept a new task.
 proc read_from_test_client fd {
     set bytes [gets $fd]
-    set payload [read $fd $bytes]
+    set payload [encoding convertfrom utf-8 [read $fd $bytes]]
     foreach {status data elapsed} $payload break
     set ::last_progress [clock seconds]
 
@@ -512,11 +524,11 @@ proc the_end {} {
 # to read the command, execute, reply... all this in a loop.
 proc test_client_main server_port {
     set ::test_server_fd [socket localhost $server_port]
-    fconfigure $::test_server_fd -encoding binary
+    fconfigure $::test_server_fd -translation binary
     send_data_packet $::test_server_fd ready [pid]
     while 1 {
         set bytes [gets $::test_server_fd]
-        set payload [read $::test_server_fd $bytes]
+        set payload [encoding convertfrom utf-8 [read $::test_server_fd $bytes]]
         foreach {cmd data} $payload break
         if {$cmd eq {run}} {
             execute_test_file $data
@@ -531,8 +543,14 @@ proc test_client_main server_port {
 
 proc send_data_packet {fd status data {elapsed 0}} {
     set payload [list $status $data $elapsed]
-    puts $fd [string length $payload]
-    puts -nonewline $fd $payload
+    # Convert to UTF-8 bytes before sending so that:
+    # 1. The byte count is accurate (Tcl 9.0 string length returns character
+    #    count, which differs from byte count for non-ASCII Unicode chars).
+    # 2. Characters above U+00FF (not representable in the channel's iso8859-1
+    #    encoding) are safely transmitted as multi-byte UTF-8 sequences.
+    set payload_bytes [encoding convertto utf-8 $payload]
+    puts $fd [string length $payload_bytes]
+    puts -nonewline $fd $payload_bytes
     flush $fd
 }
 
@@ -576,6 +594,7 @@ proc print_help_screen {} {
         "--ignore-encoding  Don't validate object encoding."
         "--ignore-digest    Don't use debug digest validations."
         "--large-memory     Run tests using over 100mb."
+        "--debug-defrag     Indicate the test is running against server compiled with DEBUG_DEFRAG option"
         "--help             Print this help screen."
     } "\n"]
 }
@@ -707,6 +726,8 @@ for {set j 0} {$j < [llength $argv]} {incr j} {
         set ::ignoreencoding 1
     } elseif {$opt eq {--ignore-digest}} {
         set ::ignoredigest 1
+    } elseif {$opt eq {--debug-defrag}} {
+        set ::debug_defrag 1
     } elseif {$opt eq {--help}} {
         print_help_screen
         exit 0

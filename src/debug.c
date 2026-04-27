@@ -23,6 +23,7 @@
 #include "cluster.h"
 #include "threads_mngr.h"
 #include "script.h"
+#include "cluster_asm.h"
 
 #include <arpa/inet.h>
 #include <signal.h>
@@ -52,7 +53,9 @@ typedef ucontext_t sigcontext_t;
 
 /* Globals */
 static int bug_report_start = 0; /* True if bug report header was already logged. */
-static pthread_mutex_t bug_report_start_mutex = PTHREAD_MUTEX_INITIALIZER;
+static pthread_mutex_t bug_report_start_mutex;
+static pthread_mutexattr_t bug_report_start_attr;
+
 /* Mutex for a case when two threads crash at the same time. */
 static pthread_mutex_t signal_handler_lock;
 static pthread_mutexattr_t signal_handler_lock_attr;
@@ -120,6 +123,14 @@ void mixStringObjectDigest(unsigned char *digest, robj *o) {
     decrRefCount(o);
 }
 
+void mixGCRAObjectDigest(unsigned char *digest, robj *o) {
+    char buf[LONG_STR_SIZE];
+    long long val;
+    getLongLongFromGCRAObject(o, &val);
+    int len = ll2string(buf, sizeof(buf), val);
+    mixDigest(digest,buf,len);
+}
+
 /* This function computes the digest of a data structure stored in the
  * object 'o'. It is the core of the DEBUG DIGEST command: when taking the
  * digest of a whole dataset, we take the digest of the key and the value
@@ -138,22 +149,24 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
     if (o->type == OBJ_STRING) {
         mixStringObjectDigest(digest,o);
     } else if (o->type == OBJ_LIST) {
-        listTypeIterator *li = listTypeInitIterator(o,0,LIST_TAIL);
+        listTypeIterator li;
         listTypeEntry entry;
-        while(listTypeNext(li,&entry)) {
+        listTypeInitIterator(&li, o, 0, LIST_TAIL);
+        while(listTypeNext(&li, &entry)) {
             robj *eleobj = listTypeGet(&entry);
             mixStringObjectDigest(digest,eleobj);
             decrRefCount(eleobj);
         }
-        listTypeReleaseIterator(li);
+        listTypeResetIterator(&li);
     } else if (o->type == OBJ_SET) {
-        setTypeIterator *si = setTypeInitIterator(o);
+        setTypeIterator si;
         sds sdsele;
-        while((sdsele = setTypeNextObject(si)) != NULL) {
+        setTypeInitIterator(&si, o);
+        while((sdsele = setTypeNextObject(&si)) != NULL) {
             xorDigest(digest,sdsele,sdslen(sdsele));
             sdsfree(sdsele);
         }
-        setTypeReleaseIterator(si);
+        setTypeResetIterator(&si);
     } else if (o->type == OBJ_ZSET) {
         unsigned char eledigest[20];
 
@@ -194,9 +207,9 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
 
             dictInitIterator(&di, zs->dict);
             while((de = dictNext(&di)) != NULL) {
-                sds sdsele = dictGetKey(de);
-                double *score = dictGetVal(de);
-                const int len = fpconv_dtoa(*score, buf);
+                zskiplistNode *znode = dictGetKey(de);
+                sds sdsele = zslGetNodeElement(znode);
+                const int len = fpconv_dtoa(znode->score, buf);
                 buf[len] = '\0';
                 memset(eledigest,0,20);
                 mixDigest(eledigest,sdsele,sdslen(sdsele));
@@ -208,26 +221,27 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             serverPanic("Unknown sorted set encoding");
         }
     } else if (o->type == OBJ_HASH) {
-        hashTypeIterator *hi = hashTypeInitIterator(o);
-        while (hashTypeNext(hi, 0) != C_ERR) {
+        hashTypeIterator hi;
+        hashTypeInitIterator(&hi, o);
+        while (hashTypeNext(&hi, 0) != C_ERR) {
             unsigned char eledigest[20];
             sds sdsele;
 
             /* field */
             memset(eledigest,0,20);
-            sdsele = hashTypeCurrentObjectNewSds(hi,OBJ_HASH_KEY);
+            sdsele = hashTypeCurrentObjectNewSds(&hi,OBJ_HASH_KEY);
             mixDigest(eledigest,sdsele,sdslen(sdsele));
             sdsfree(sdsele);
             /* val */
-            sdsele = hashTypeCurrentObjectNewSds(hi,OBJ_HASH_VALUE);
+            sdsele = hashTypeCurrentObjectNewSds(&hi,OBJ_HASH_VALUE);
             mixDigest(eledigest,sdsele,sdslen(sdsele));
             sdsfree(sdsele);
             /* hash-field expiration (HFE) */
-            if (hi->expire_time != EB_EXPIRE_TIME_INVALID)
+            if (hi.expire_time != EB_EXPIRE_TIME_INVALID)
                 xorDigest(eledigest,"!!hexpire!!",11);
             xorDigest(digest,eledigest,20);
         }
-        hashTypeReleaseIterator(hi);
+        hashTypeResetIterator(&hi);
     } else if (o->type == OBJ_STREAM) {
         streamIterator si;
         streamIteratorStart(&si,o->ptr,NULL,NULL,0);
@@ -249,6 +263,8 @@ void xorObjectDigest(redisDb *db, robj *keyobj, unsigned char *digest, robj *o) 
             }
         }
         streamIteratorStop(&si);
+    } else if (o->type == OBJ_GCRA) {
+        mixGCRAObjectDigest(digest, o);
     } else if (o->type == OBJ_MODULE) {
         RedisModuleDigest md = {{0},{0},keyobj,db->id};
         moduleValue *mv = o->ptr;
@@ -283,14 +299,15 @@ void computeDatasetDigest(unsigned char *final) {
         redisDb *db = server.db+j;
         if (kvstoreSize(db->keys) == 0)
             continue;
-        kvstoreIterator *kvs_it = kvstoreIteratorInit(db->keys);
 
         /* hash the DB id, so the same dataset moved in a different DB will lead to a different digest */
         aux = htonl(j);
         mixDigest(final,&aux,sizeof(aux));
 
         /* Iterate this DB writing every entry */
-        while((de = kvstoreIteratorNext(kvs_it)) != NULL) {
+        kvstoreIterator kvs_it;
+        kvstoreIteratorInit(&kvs_it, db->keys);
+        while((de = kvstoreIteratorNext(&kvs_it)) != NULL) {
             robj *keyobj;
 
             memset(digest,0,20); /* This key-val digest */
@@ -306,7 +323,7 @@ void computeDatasetDigest(unsigned char *final) {
             xorDigest(final,digest,20);
             decrRefCount(keyobj);
         }
-        kvstoreIteratorRelease(kvs_it);
+        kvstoreIteratorReset(&kvs_it);
     }
 }
 
@@ -429,6 +446,8 @@ void debugCommand(client *c) {
 "    Show low level info about `key` and associated value.",
 "DROP-CLUSTER-PACKET-FILTER <packet-type>",
 "    Drop all packets that match the filtered type. Set to -1 allow all packets.",
+"ENABLE-KEYMETA-RUNTIME-REGISTRATION <0|1>",
+"    Allow keymeta class registration outside server startup (for testing).",
 "OOM",
 "    Crash the server simulating an out-of-memory error.",
 "PANIC",
@@ -465,6 +484,10 @@ void debugCommand(client *c) {
 "    Setting it to 0 disables expiring keys (and hash-fields) in background ",
 "    when they are not accessed (otherwise the Redis behavior). Setting it",
 "    to 1 reenables back the default.",
+"SET-ALLOW-ACCESS-EXPIRED <0|1>",
+"    Setting it to 0 prevents access to expired keys (and hash-fields),",
+"    simulating the standard Redis behavior. Setting it to 1 allows",
+"    access to expired keys (and hash-fields) without triggering deletion.",
 "QUICKLIST-PACKED-THRESHOLD <size>",
 "    Sets the threshold for elements to be inserted as plain vs packed nodes",
 "    Default value is 1GB, allows values up to 4GB. Setting to 0 restores to default.",
@@ -491,6 +514,8 @@ void debugCommand(client *c) {
 "    In case RESET is provided the peak reset time will be restored to the default value",
 "REPLYBUFFER RESIZING <0|1>",
 "    Enable or disable the reply buffer resize cron job",
+"REPLY-COPY-AVOIDANCE <0|1>",
+"    Enable/disable reply copy avoidance optimization.",
 "REPL-PAUSE <clear|after-fork|before-rdb-channel|on-streaming-repl-buf>",
 "    Pause the server's main process during various replication steps.",
 "DICT-RESIZING <0|1>",
@@ -499,6 +524,12 @@ void debugCommand(client *c) {
 "    Output SHA and content of all scripts or of a specific script with its SHA.",
 "MARK-INTERNAL-CLIENT [UNMARK]",
 "    Promote the current connection to an internal connection.",
+"ASM-FAILPOINT <channel> <state>",
+"    Set a fail point for the specified channel and state for cluster atomic slot migration.",
+"ASM-TRIM-METHOD <default|none|active|bg> <active-trim-delay> ",
+"    Disable trimming or force active/background trimming for cluster atomic slot migration.",
+"    Active trim delay is used only when method is 'active'. If it is negative,",
+"    active trim is disabled.",
 NULL
         };
         addExtendedReplyHelp(c, help, clusterDebugCommandExtendedHelp());
@@ -534,7 +565,19 @@ NULL
         long long flag;
         if (getLongLongFromObjectOrReply(c, c->argv[2], &flag, NULL) != C_OK)
             return;
-        server.dbg_assert_keysizes = (flag != 0);
+        if (flag)
+            server.dbg_assert_flags |= DBG_ASSERT_KEYSIZES;
+        else
+            server.dbg_assert_flags &= ~DBG_ASSERT_KEYSIZES;
+        addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"ALLOCSIZE-SLOTS-ASSERT") && c->argc == 3) {
+        long long flag;
+        if (getLongLongFromObjectOrReply(c, c->argv[2], &flag, NULL) != C_OK)
+            return;
+        if (flag)
+            server.dbg_assert_flags |= DBG_ASSERT_ALLOC_SLOT;
+        else
+            server.dbg_assert_flags &= ~DBG_ASSERT_ALLOC_SLOT;
         addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"log") && c->argc == 3) {
         serverLog(LL_WARNING, "DEBUG LOG: %s", (char*)c->argv[2]->ptr);
@@ -762,7 +805,7 @@ NULL
                 memcpy(val->ptr, buf, valsize<=buflen? valsize: buflen);
             }
             dbAdd(c->db, key, &val);
-            signalModifiedKey(c,c->db,key);
+            keyModified(c,c->db,key,val,1);
             decrRefCount(key);
         }
         addReply(c,shared.ok);
@@ -863,7 +906,7 @@ NULL
             addReplyError(c,"Wrong protocol type name. Please use one of the following: string|integer|double|bignum|null|array|set|map|attrib|push|verbatim|true|false");
         }
     } else if (!strcasecmp(c->argv[1]->ptr,"sleep") && c->argc == 3) {
-        double dtime = fast_float_strtod(c->argv[2]->ptr,NULL);
+        double dtime = fast_float_strtod(c->argv[2]->ptr,sdslen(c->argv[2]->ptr),NULL);
         long long utime = dtime*1000000;
         struct timespec tv;
 
@@ -875,6 +918,11 @@ NULL
                c->argc == 3)
     {
         server.active_expire_enabled = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"set-allow-access-expired") &&
+               c->argc == 3)
+    {
+        server.allow_access_expired = atoi(c->argv[2]->ptr);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"quicklist-packed-threshold") &&
                c->argc == 3)
@@ -890,6 +938,11 @@ NULL
                c->argc == 3)
     {
         server.skip_checksum_validation = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"enable-keymeta-runtime-registration") &&
+               c->argc == 3)
+    {
+        server.allow_keymeta_registration = atoi(c->argv[2]->ptr);
         addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"aof-flush-sleep") &&
                c->argc == 3)
@@ -1047,6 +1100,9 @@ NULL
             return;
         }
         addReply(c, shared.ok);
+    } else if (!strcasecmp(c->argv[1]->ptr,"reply-copy-avoidance") && c->argc == 3) {
+        server.reply_copy_avoidance_enabled = atoi(c->argv[2]->ptr);
+        addReply(c,shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr, "repl-pause") && c->argc == 3) {
         if (!strcasecmp(c->argv[2]->ptr, "clear")) {
             server.repl_debug_pause = REPL_DEBUG_PAUSE_NONE;
@@ -1065,6 +1121,10 @@ NULL
         server.dict_resizing = atoi(c->argv[2]->ptr);
         addReply(c, shared.ok);
     } else if (!strcasecmp(c->argv[1]->ptr,"script") && c->argc == 3) {
+        if (server.hide_user_data_from_log) {
+            addReplyError(c, "DEBUG SCRIPT is disabled when hide-user-data-from-log is enabled");
+            return;
+        }
         if (!strcasecmp(c->argv[2]->ptr,"list")) {
             dictIterator di;
             dictEntry *de;
@@ -1098,6 +1158,19 @@ NULL
         } else {
             addReplySubcommandSyntaxError(c);
             return;
+        }
+    } else if(!strcasecmp(c->argv[1]->ptr,"asm-failpoint") && c->argc == 4) {
+        if (asmDebugSetFailPoint(c->argv[2]->ptr, c->argv[3]->ptr) != C_OK) {
+            addReplyError(c, "Failed to set ASM fail point");
+        } else {
+            addReply(c, shared.ok);
+        }
+    } else if(!strcasecmp(c->argv[1]->ptr,"asm-trim-method") && c->argc >= 3) {
+        int delay = c->argc == 4 ? atoi(c->argv[3]->ptr) : 0;
+        if (asmDebugSetTrimMethod(c->argv[2]->ptr, delay) != C_OK) {
+            addReplyError(c, "Failed to set ASM trim method");
+        } else {
+            addReply(c, shared.ok);
         }
     } else if(!handleDebugClusterCommand(c)) {
         addReplySubcommandSyntaxError(c);
@@ -1222,7 +1295,7 @@ void serverLogObjectDebugInfo(const robj *o) {
      * random memory portion to be "leaked" into the logfile. */
     if (o->type == OBJ_STRING && sdsEncodedObject(o)) {
         serverLog(LL_WARNING,"Object raw string len: %zu", sdslen(o->ptr));
-        if (sdslen(o->ptr) < 4096) {
+        if (!server.hide_user_data_from_log && sdslen(o->ptr) < 4096) {
             sds repr = sdscatrepr(sdsempty(),o->ptr,sdslen(o->ptr));
             serverLog(LL_WARNING,"Object raw string content: %s", repr);
             sdsfree(repr);
@@ -1239,6 +1312,10 @@ void serverLogObjectDebugInfo(const robj *o) {
             serverLog(LL_WARNING,"Skiplist level: %d", (int) ((const zset*)o->ptr)->zsl->level);
     } else if (o->type == OBJ_STREAM) {
         serverLog(LL_WARNING,"Stream size: %d", (int) streamLength(o));
+    } else if (o->type == OBJ_GCRA) {
+#if UINTPTR_MAX == 0xffffffffffffffff
+        serverLog(LL_WARNING, "GCRA object: %lld", (long long)o->ptr);
+#endif
     }
 #endif
 }
@@ -1286,9 +1363,9 @@ void _serverPanic(const char *file, int line, const char *msg, ...) {
 int bugReportStart(void) {
     pthread_mutex_lock(&bug_report_start_mutex);
     if (bug_report_start == 0) {
+        bug_report_start = 1;
         serverLogRaw(LL_WARNING|LL_RAW,
         "\n\n=== REDIS BUG REPORT START: Cut & paste starting from here ===\n");
-        bug_report_start = 1;
         pthread_mutex_unlock(&bug_report_start_mutex);
         return 1;
     }
@@ -2204,7 +2281,7 @@ void logCurrentClient(client *cc, const char *title) {
         robj *key = getDecodedObject(cc->argv[1]);
         kvobj *kv = dbFind(cc->db, key->ptr);
         if (kv) {
-            serverLog(LL_WARNING,"key '%s' found in DB containing the following object:", (char*)key->ptr);
+            serverLog(LL_WARNING,"key '%s' found in DB containing the following object:", redactLogCstr((char*)key->ptr));
             serverLogObjectDebugInfo(kv);
         }
         decrRefCount(key);
@@ -2469,6 +2546,12 @@ void setupSigSegvHandler(void) {
         pthread_mutexattr_init(&signal_handler_lock_attr);
         pthread_mutexattr_settype(&signal_handler_lock_attr, PTHREAD_MUTEX_ERRORCHECK);
         pthread_mutex_init(&signal_handler_lock, &signal_handler_lock_attr);
+
+        pthread_mutexattr_init(&bug_report_start_attr);
+        /* Use recursive to avoid deadlock when a signal is raised during bugReportStart(). */
+        pthread_mutexattr_settype(&bug_report_start_attr, PTHREAD_MUTEX_RECURSIVE);
+        pthread_mutex_init(&bug_report_start_mutex, &bug_report_start_attr);
+
         signal_handler_lock_initialized = 1;
     }
 

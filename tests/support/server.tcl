@@ -1,3 +1,17 @@
+#
+# Copyright (c) 2009-Present, Redis Ltd.
+# All rights reserved.
+#
+# Copyright (c) 2024-present, Valkey contributors.
+# All rights reserved.
+#
+# Licensed under your choice of (a) the Redis Source Available License 2.0
+# (RSALv2); or (b) the Server Side Public License v1 (SSPLv1); or (c) the
+# GNU Affero General Public License v3 (AGPLv3).
+#
+# Portions of this file are available under BSD3 terms; see REDISCONTRIBUTIONS for more information.
+#
+
 set ::global_overrides {}
 set ::tags {}
 set ::valgrind_errors {}
@@ -142,7 +156,7 @@ proc ping_server {host port} {
     set retval 0
     if {[catch {
         if {$::tls} {
-            set fd [::tls::socket $host $port] 
+            set fd [::tls::socket $host $port]
         } else {
             set fd [socket $host $port]
         }
@@ -165,6 +179,120 @@ proc ping_server {host port} {
         }
     }
     return $retval
+}
+
+# Ping server with a timeout. Returns 1 if server responds within timeout_ms,
+# otherwise returns 0. Uses blocking TCP connect (instant on localhost) and
+# Tcl's event loop (fileevent + vwait + after) for reliable timeouts.
+# For TLS, the handshake is performed separately in non-blocking mode so that
+# a paused/unresponsive server triggers the timeout instead of hanging.
+proc ping_server_with_timeout {host port timeout_ms} {
+    set retval 0
+    set fd {}
+    set wait_var "::ping_wait_[incr ::ping_server_uid]"
+    if {[catch {
+        # TCP connect is always blocking: instant on localhost even if the
+        # server process is paused, because the kernel handles SYN/ACK.
+        set fd [socket $host $port]
+
+        if {$::tls} {
+            # Perform TLS handshake in non-blocking mode with a timeout.
+            # We avoid ::tls::socket because it blocks indefinitely when the
+            # server is paused (SIGSTOP) -- the TLS handshake requires active
+            # server participation that a paused process cannot provide.
+            ::tls::import $fd \
+                -cafile "$::tlsdir/ca.crt" \
+                -certfile "$::tlsdir/client.crt" \
+                -keyfile "$::tlsdir/client.key"
+            fconfigure $fd -blocking 0
+            set hs_done 0
+            set hs_end [expr {[clock milliseconds] + $timeout_ms}]
+            while {!$hs_done && [clock milliseconds] < $hs_end} {
+                if {[catch {set hs_done [::tls::handshake $fd]}]} break
+                if {!$hs_done} {
+                    set $wait_var ""
+                    after 10 [list set $wait_var "x"]
+                    vwait $wait_var
+                }
+            }
+            if {!$hs_done} {
+                error "TLS handshake did not complete"
+            }
+            fconfigure $fd -blocking 1
+        }
+
+        fconfigure $fd -translation binary -buffering full
+        puts $fd "PING\r\n"
+        flush $fd
+
+        # Read timeout via event loop: whichever fires first unblocks vwait
+        set $wait_var ""
+        set timer [after $timeout_ms [list set $wait_var "timeout"]]
+        fileevent $fd readable [list set $wait_var "readable"]
+        vwait $wait_var
+
+        after cancel $timer
+        fileevent $fd readable {}
+
+        if {[set $wait_var] eq "readable"} {
+            set reply [gets $fd]
+            if {[string range $reply 0 0] eq {+} ||
+                [string range $reply 0 0] eq {-}} {
+                set retval 1
+            }
+        }
+        close $fd
+        set fd {}
+    } e]} {
+        if {$fd ne {}} {
+            catch {close $fd}
+        }
+    }
+    unset -nocomplain $wait_var
+    return $retval
+}
+set ::ping_server_uid 0
+
+# Save configuration for a single server.
+# Arguments:
+#   client - Redis client object to use for CONFIG GET
+# Returns: A dict of {param value} pairs
+proc save_single_server_config {client} {
+    set saved_config {}
+    foreach {param val} [$client config get *] {
+        dict set saved_config $param $val
+    }
+    return $saved_config
+}
+
+# Restore configuration for a single server.
+# Arguments:
+#   client       - Redis client object to use for CONFIG SET
+#   saved_config - Dict of {param value} pairs from save_single_server_config
+#   diff_based   - If 1, only restore configs that actually changed (default: 0)
+proc restore_single_server_config {client saved_config {diff_based 0}} {
+    if {$diff_based} {
+        # Get current config state for comparison
+        set current_config [save_single_server_config $client]
+
+        # Only restore configs that changed
+        dict for {param saved_val} $saved_config {
+            if {[catch {dict get $current_config $param} current_val]} {
+                # Parameter no longer exists, skip it
+                continue
+            }
+            if {$saved_val ne $current_val} {
+                # Config was modified - restore it
+                catch {$client config set $param $saved_val}
+            }
+        }
+    } else {
+        # Restore all configs (original behavior)
+        dict for {param val} $saved_config {
+            # Some may fail, specifically immutable ones
+            catch {$client config set $param $val}
+        }
+    }
 }
 
 # Return 1 if the server at the specified addr is reachable by PING, otherwise
@@ -222,6 +350,11 @@ proc tags_acceptable {tags err_return} {
         return 0
     }
 
+    if {$::debug_defrag && [lsearch $tags "debug_defrag:skip"] >= 0} {
+        set err "Not supported on server compiled with DEBUG_DEFRAG option"
+        return 0
+    }
+
     if {$::singledb && [lsearch $tags "singledb:skip"] >= 0} {
         set err "Not supported on singledb"
         return 0
@@ -267,7 +400,10 @@ proc tags {tags code} {
         set ::tags [lrange $::tags 0 end-[llength $tags]]
         return
     }
-    uplevel 1 $code
+    if {[catch {uplevel 1 $code} error]} {
+        set ::tags [lrange $::tags 0 end-[llength $tags]]
+        error $error $::errorInfo
+    }
     set ::tags [lrange $::tags 0 end-[llength $tags]]
 }
 
@@ -387,11 +523,9 @@ proc run_external_server_test {code overrides} {
     r script flush
     r config resetstat
 
-    # store configs
-    set saved_config {}
-    foreach {param val} [r config get *] {
-        dict set saved_config $param $val
-    }
+    # Resolve client dynamically via srv (not the captured $client variable)
+    # to handle reconnections that replace the client in ::servers.
+    set saved_config [save_single_server_config [srv 0 "client"]]
 
     # apply overrides
     foreach {param val} $overrides {
@@ -420,11 +554,10 @@ proc run_external_server_test {code overrides} {
         }
     }
 
-    # restore overrides
-    dict for {param val} $saved_config {
-        # some may fail, specifically immutable ones.
-        catch {r config set $param $val}
-    }
+    # Resolve client dynamically from ::servers rather than using the captured
+    # $client variable. If a reconnect occurred during test execution, $client
+    # references the old (closed) connection while ::servers holds the new one.
+    restore_single_server_config [srv 0 "client"] $saved_config
 
     set srv [lpop ::servers]
     
@@ -467,8 +600,8 @@ proc start_server {options {code undefined}} {
             "tags" {
                 # If we 'tags' contain multiple tags, quoted and separated by spaces,
                 # we want to get rid of the quotes in order to have a proper list
-                set tags [string map { \" "" } $value]
-                set ::tags [concat $::tags $tags]
+                set _tags [string map { \" "" } $value]
+                set tags [concat $tags $_tags]
             }
             "keep_persistence" {
                 set keep_persistence $value
@@ -481,6 +614,7 @@ proc start_server {options {code undefined}} {
             }
         }
     }
+    set ::tags [concat $::tags $tags]
 
     # We skip unwanted tags
     if {![tags_acceptable $::tags err]} {
@@ -558,6 +692,12 @@ proc start_server {options {code undefined}} {
         dict set config "client-default-resp" "3"
     }
 
+    if {$::debug_defrag} {
+        dict set config "activedefrag" "yes" ;# defrag enabled
+        dict set config "active-defrag-cycle-min" "65"
+        dict set config "active-defrag-cycle-max" "75"
+    }
+
     # write new configuration to temporary file
     set config_file [tmpfile redis.conf]
     create_server_config_file $config_file $config $config_lines
@@ -630,6 +770,7 @@ proc start_server {options {code undefined}} {
             set err {}
             append err [exec cat $stdout] "\n" [exec cat $stderr]
             start_server_error $config_file $err
+            set ::tags [lrange $::tags 0 end-[llength $tags]]
             return
         }
         set server_started 1
@@ -659,6 +800,7 @@ proc start_server {options {code undefined}} {
     if {$code ne "undefined"} {
         set line [exec head -n1 $stdout]
         if {[string match {*already in use*} $line]} {
+            set ::tags [lrange $::tags 0 end-[llength $tags]]
             error_and_quit $config_file $line
         }
 
@@ -730,6 +872,7 @@ proc start_server {options {code undefined}} {
                 send_data_packet $::test_server_fd err [join $details "\n"]
             } else {
                 # Re-raise, let handler up the stack take care of this.
+                set ::tags [lrange $::tags 0 end-[llength $tags]]
                 error $error $backtrace
             }
         } else {
